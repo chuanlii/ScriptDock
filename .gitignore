@@ -1,0 +1,45 @@
+.venv/
+__pycache__/
+.pytest_cache/
+build/
+dist/
+*.pyc
+
+# Local assistant state and development-only instructions
+.codex/
+AGENTS.md
+
+# Generated binaries, media and documents (source-only repository)
+*.exe
+*.dll
+*.pyd
+*.ico
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.pdf
+*.docx
+*.zip
+*.7z
+
+# Runtime logs, private configuration and credentials
+*.log
+*.bak
+*.tmp
+config.json
+config.json.*
+.env
+.env.*
+!.env.example
+credentials*.json
+secrets*.json
+*.pem
+*.key
+*.pfx
+
+# Editor / OS state
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
