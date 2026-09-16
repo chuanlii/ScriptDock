@@ -17,6 +17,7 @@ from typing import Iterable
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -192,6 +193,10 @@ class ScriptDialog(QDialog):
         self.interpreter_browse_button = QPushButton("浏览…", self)
         self.interpreter_browse_button.setAutoDefault(False)
 
+        self.auto_start_checkbox = QCheckBox("随 ScriptDock 自动启动", self)
+        self.auto_start_checkbox.setObjectName("autoStartCheckBox")
+        self.auto_start_checkbox.setChecked(False)
+
         # Friendly aliases used by a few integrations and by older previews.
         self.script_path_edit = self.path_edit
         self.arguments_edit = self.args_edit
@@ -202,6 +207,7 @@ class ScriptDialog(QDialog):
         self.args_input = self.args_edit
         self.working_directory_input = self.working_directory_edit
         self.interpreter_input = self.interpreter_edit
+        self.auto_start_input = self.auto_start_checkbox
 
         path_row = QHBoxLayout()
         path_row.setContentsMargins(0, 0, 0, 0)
@@ -228,6 +234,7 @@ class ScriptDialog(QDialog):
         form.addRow("启动参数", self.args_edit)
         form.addRow("工作目录", workdir_row)
         form.addRow("解释器", interpreter_row)
+        form.addRow("启动选项", self.auto_start_checkbox)
 
         hint = QLabel("名称必填；路径扩展名决定脚本类型。参数按 Windows 命令行规则解析。", self)
         hint.setObjectName("formHint")
@@ -274,6 +281,7 @@ class ScriptDialog(QDialog):
         self.args_edit.setText(_command_line_from_args(getattr(config, "args", []) or []))
         self.working_directory_edit.setText(str(getattr(config, "working_directory", "") or ""))
         self.interpreter_edit.setText(str(getattr(config, "interpreter", "") or ""))
+        self.auto_start_checkbox.setChecked(bool(getattr(config, "auto_start", False)))
         self._set_type_display(getattr(config, "type", ""), path)
 
     def _set_type_display(self, value: object, path: str = "") -> None:
@@ -370,7 +378,7 @@ class ScriptDialog(QDialog):
         if filename:
             self.interpreter_edit.setText(filename)
 
-    def _validate_fields(self) -> tuple[str, str, str, list[str], str, str]:
+    def _validate_fields(self) -> tuple[str, str, str, list[str], str, str, bool]:
         name = self.name_edit.text().strip()
         if not name:
             raise ValueError("请输入脚本名称。")
@@ -383,7 +391,8 @@ class ScriptDialog(QDialog):
         args = _command_line_to_argv_windows(self.args_edit.text())
         workdir = self.working_directory_edit.text().strip()
         interpreter = self.interpreter_edit.text().strip()
-        return name, path, type_name, args, workdir, interpreter
+        auto_start = self.auto_start_checkbox.isChecked()
+        return name, path, type_name, args, workdir, interpreter, auto_start
 
     def get_config(self) -> ScriptConfig:
         """Return a validated model object from the current form values.
@@ -392,8 +401,12 @@ class ScriptDialog(QDialog):
         a small warning dialog when the user presses Save.
         """
 
-        name, path, type_name, args, workdir, interpreter = self._validate_fields()
+        name, path, type_name, args, workdir, interpreter, auto_start = self._validate_fields()
         script_id = str(getattr(self.config, "id", "") or uuid.uuid4().hex)
+        # ``web_url`` remains a model field for loading old configurations,
+        # but is intentionally not editable.  Preserve it during edits so
+        # changing an unrelated setting does not silently discard old data.
+        web_url = str(getattr(self.config, "web_url", "") or "") if self.config is not None else ""
         config = ScriptConfig(
             id=script_id,
             name=name,
@@ -402,6 +415,8 @@ class ScriptDialog(QDialog):
             args=args,
             working_directory=workdir,
             interpreter=interpreter or None,
+            auto_start=auto_start,
+            web_url=web_url,
         )
         validator = getattr(config, "validate", None)
         if callable(validator):

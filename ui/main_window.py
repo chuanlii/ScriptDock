@@ -11,8 +11,8 @@ from collections import deque
 from pathlib import Path
 from typing import Iterable
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import QTimer, QUrl, Qt, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QComboBox,
     QAbstractItemView,
@@ -60,6 +60,7 @@ class MainWindow(QMainWindow):
     quit_requested = Signal()
 
     MAX_LOG_LINES = 5000
+    WEB_REFRESH_INTERVAL_MS = 1000
     ACTIVE_STATUSES = frozenset({"Running", "Starting", "Stopping"})
 
     def __init__(self, manager, config_manager, scripts: Iterable[ScriptConfig] | None = None):
@@ -91,6 +92,10 @@ class MainWindow(QMainWindow):
         self._log_timer.setInterval(100)
         self._log_timer.timeout.connect(self._flush_dirty_logs)
         self._log_timer.start()
+        self._web_timer = QTimer(self)
+        self._web_timer.setInterval(self.WEB_REFRESH_INTERVAL_MS)
+        self._web_timer.timeout.connect(self._refresh_web_buttons)
+        self._web_timer.start()
         self._rebuild_table()
 
     # ---- construction -------------------------------------------------
@@ -123,23 +128,20 @@ class MainWindow(QMainWindow):
         self.add_button.setObjectName("primaryButton")
         self.edit_button = QPushButton("编辑")
         self.delete_button = QPushButton("删除")
-        self.exit_button = QPushButton("退出")
         self.edit_button.setEnabled(False)
         self.delete_button.setEnabled(False)
         self.add_button.clicked.connect(self.add_script)
         self.edit_button.clicked.connect(self.edit_script)
         self.delete_button.clicked.connect(self.delete_script)
-        self.exit_button.clicked.connect(self.request_quit)
         toolbar.addWidget(self.add_button)
         toolbar.addWidget(self.edit_button)
         toolbar.addWidget(self.delete_button)
         toolbar.addStretch(1)
-        toolbar.addWidget(self.exit_button)
         layout.addLayout(toolbar)
 
-        self.script_table = QTableWidget(0, 4, self)
+        self.script_table = QTableWidget(0, 5, self)
         self.script_table.setObjectName("scriptTable")
-        self.script_table.setHorizontalHeaderLabels(["名称", "类型", "状态", "操作"])
+        self.script_table.setHorizontalHeaderLabels(["名称", "类型", "状态", "自启动", "操作"])
         self.script_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.script_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.script_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -152,6 +154,7 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.script_table.itemSelectionChanged.connect(self._on_selection_changed)
         layout.addWidget(self.script_table, 3)
         # Compatibility aliases for simple integrations/tests.
@@ -241,24 +244,42 @@ class MainWindow(QMainWindow):
                 self.script_table.setItem(row, 1, type_item)
 
                 status = self._status(script_id)
-                status_item = QTableWidgetItem(status)
+                status_item = QTableWidgetItem()
                 self._style_status_item(status_item, status)
                 self.script_table.setItem(row, 2, status_item)
+
+                auto_start = bool(getattr(config, "auto_start", False))
+                auto_start_item = QTableWidgetItem("是" if auto_start else "否")
+                auto_start_item.setData(Qt.ItemDataRole.UserRole, auto_start)
+                self.script_table.setItem(row, 3, auto_start_item)
 
                 controls = QWidget(self.script_table)
                 controls_layout = QHBoxLayout(controls)
                 controls_layout.setContentsMargins(3, 1, 3, 1)
                 controls_layout.setSpacing(4)
                 buttons: dict[str, QPushButton] = {}
-                for action, label in (("start", "启动"), ("stop", "停止"), ("restart", "重启")):
+                for action, label in (
+                    ("start", "启动"),
+                    ("stop", "停止"),
+                    ("restart", "重启"),
+                    ("web", "打开网页"),
+                ):
                     button = QPushButton(label, controls)
                     button.setObjectName(f"{action}Button")
-                    button.setToolTip(action.title())
-                    button.clicked.connect(lambda _checked=False, sid=script_id, a=action: self._run_action(sid, a))
+                    button.setToolTip("打开网页" if action == "web" else action.title())
+                    if action == "web":
+                        button.clicked.connect(
+                            lambda _checked=False, sid=script_id: self._open_web(sid)
+                        )
+                        button.setEnabled(self._web_url_for_script(script_id) is not None)
+                    else:
+                        button.clicked.connect(
+                            lambda _checked=False, sid=script_id, a=action: self._run_action(sid, a)
+                        )
                     controls_layout.addWidget(button)
                     buttons[action] = button
                 self._row_controls[script_id] = buttons
-                self.script_table.setCellWidget(row, 3, controls)
+                self.script_table.setCellWidget(row, 4, controls)
 
                 self.script_table.setRowHeight(row, 42)
                 self._update_row_actions(script_id)
@@ -329,6 +350,9 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _style_status_item(item: QTableWidgetItem, status: str) -> None:
+        status = str(status)
+        item.setText(status)
+        item.setData(Qt.ItemDataRole.UserRole, status)
         item.setForeground(QColor(_STATUS_COLORS.get(status, "#475569")))
         item.setToolTip(status)
 
@@ -340,9 +364,9 @@ class MainWindow(QMainWindow):
             if item is None:
                 item = QTableWidgetItem()
                 self.script_table.setItem(row, 2, item)
-            item.setText(str(status))
             self._style_status_item(item, str(status))
         self._update_row_actions(script_id)
+        self._update_web_button(script_id)
         if script_id == self._selected_id:
             self._update_selection_buttons()
 
@@ -442,6 +466,85 @@ class MainWindow(QMainWindow):
 
     def _restart_script(self, script_id: str) -> None:
         self._run_action(script_id, "restart")
+
+    # ---- web links ---------------------------------------------------
+
+    @staticmethod
+    def _web_url(value: object) -> QUrl | None:
+        """Return a usable HTTP(S) URL, or ``None`` for an invalid value."""
+
+        if isinstance(value, QUrl):
+            url = value
+            if (
+                not url.isValid()
+                or url.scheme().lower() not in {"http", "https"}
+                or not url.host()
+                or url.authority().endswith(":")
+            ):
+                return None
+            return url
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if any(character.isspace() for character in text):
+            return None
+        url = QUrl(text, QUrl.ParsingMode.StrictMode)
+        if (
+            not url.isValid()
+            or url.scheme().lower() not in {"http", "https"}
+            or not url.host()
+            or url.authority().endswith(":")
+        ):
+            return None
+        return url
+
+    def _is_running(self, script_id: str) -> bool:
+        if self._status(script_id) != "Running":
+            return False
+        try:
+            return bool(self.manager.is_running(script_id))
+        except Exception:
+            return True
+
+    def _web_url_for_script(self, script_id: str) -> QUrl | None:
+        """Return the manager-detected URL for a currently running script."""
+
+        if not self._is_running(script_id):
+            return None
+        try:
+            value = self.manager.get_web_url(script_id)
+        except Exception:
+            return None
+        return self._web_url(value)
+
+    def _update_web_button(self, script_id: str) -> None:
+        buttons = self._row_controls.get(str(script_id))
+        if buttons and "web" in buttons:
+            buttons["web"].setEnabled(self._web_url_for_script(str(script_id)) is not None)
+
+    def _refresh_web_buttons(self) -> None:
+        for script_id in tuple(self._row_controls):
+            self._update_web_button(script_id)
+
+    def _open_web(self, script_id: str) -> bool:
+        # Resolve the URL again at click time: the detected port can change
+        # after the button was enabled by the periodic refresh.
+        url = self._web_url_for_script(str(script_id))
+        if url is None:
+            QMessageBox.warning(self, "打开网页失败", "脚本未运行或尚未检测到监听端口。")
+            return False
+        try:
+            opened = QDesktopServices.openUrl(url)
+        except Exception as error:
+            QMessageBox.warning(self, "打开网页失败", str(error))
+            return False
+        if opened is False:
+            QMessageBox.warning(self, "打开网页失败", "系统无法打开该网页。")
+            return False
+        return True
+
+    # Explicit alias for integrations that use a descriptive slot name.
+    _open_webpage = _open_web
 
     # ---- configuration transactions ---------------------------------
 

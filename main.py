@@ -4,7 +4,7 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Signal, Qt, QTimer
+from PySide6.QtCore import QObject, Signal, Slot, Qt, QTimer
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
@@ -16,6 +16,36 @@ from ui.main_window import MainWindow
 
 class ExitBridge(QObject):
     finished = Signal(str)
+
+
+class ScriptNotifications(QObject):
+    """Receive worker signals on the GUI thread before showing tray messages."""
+
+    def __init__(self, tray, manager, parent=None):
+        super().__init__(parent)
+        self.tray = tray
+        self.manager = manager
+        self.enabled = True
+
+    @Slot(str, object)
+    def abnormal_exit(self, script_id, code):
+        if not self.enabled:
+            return
+        config = self.manager.get_config(script_id)
+        if config is None:
+            return
+        self.tray.showMessage(
+            "ScriptDock · 脚本异常退出",
+            f"{config.name} 脚本发生异常退出（退出码 {code}），请查看输出日志。",
+            QSystemTrayIcon.MessageIcon.Warning,
+            10000,
+        )
+
+
+def start_auto_scripts(manager, scripts):
+    for script in scripts:
+        if script.auto_start:
+            manager.start(script.id)
 
 
 def handle_tray_activation(reason, show_window):
@@ -57,6 +87,8 @@ def main():
         manager.register(script)
     window = MainWindow(manager, config_manager, scripts)
     tray = QSystemTrayIcon(icon, app)
+    notifications = ScriptNotifications(tray, manager, app)
+    manager.abnormal_exit.connect(notifications.abnormal_exit)
     tray.setToolTip("ScriptDock · 脚本托盘管理器")
     menu = QMenu()
     def show_window():
@@ -82,6 +114,7 @@ def main():
                                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return
         exiting = True
+        notifications.enabled = False
         window.setEnabled(False)
         exit_action.setEnabled(False)
         def finish():
@@ -95,6 +128,7 @@ def main():
         nonlocal exiting
         if error:
             exiting = False
+            notifications.enabled = True
             window.setEnabled(True)
             exit_action.setEnabled(True)
             show_window()
@@ -115,6 +149,7 @@ def main():
     server.newConnection.connect(new_connection)
     tray.show()
     show_window()
+    QTimer.singleShot(0, lambda: start_auto_scripts(manager, scripts))
     if config_manager.last_error:
         QTimer.singleShot(0, lambda: QMessageBox.warning(window, "配置加载提醒", config_manager.last_error))
     return app.exec()

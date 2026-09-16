@@ -181,6 +181,158 @@ def test_python_nonzero_exit_is_failed_and_records_exit_code(tmp_path, qapp, man
     assert any("退出码 7" in line for line in logs_for(manager, "failed", "system"))
 
 
+def test_fast_nonzero_exit_emits_one_abnormal_event_per_run(tmp_path, qapp, manager):
+    script = write_script(
+        tmp_path,
+        "fast_failure.py",
+        "import sys\n"
+        "print('fast failure', flush=True)\n"
+        "raise SystemExit(7)\n",
+    )
+    register(manager, python_config(script, "fast-failure"))
+    events = []
+    manager.abnormal_exit.connect(lambda script_id, code: events.append((script_id, code)))
+
+    manager.start("fast-failure")
+    wait_for(qapp, lambda: manager.get_status("fast-failure") == "Failed")
+    wait_for(qapp, lambda: len(events) == 1)
+    assert events == [("fast-failure", 7)]
+
+    # A second real launch gets a distinct watcher and exactly one additional
+    # event; the first launch must not be replayed by a busy-period race.
+    manager.start("fast-failure")
+    wait_for(qapp, lambda: len(events) == 2)
+    assert events == [("fast-failure", 7), ("fast-failure", 7)]
+    assert len([line for line in logs_for(manager, "fast-failure", "system") if "退出码 7" in line]) == 2
+
+
+def test_normal_exit_does_not_emit_abnormal_event(tmp_path, qapp, manager):
+    script = write_script(tmp_path, "normal_no_alert.py", "print('normal', flush=True)\n")
+    register(manager, python_config(script, "normal-no-alert"))
+    events = []
+    manager.abnormal_exit.connect(lambda script_id, code: events.append((script_id, code)))
+
+    manager.start("normal-no-alert")
+    wait_for(qapp, lambda: manager.get_status("normal-no-alert") == "Stopped")
+    # Pump the queued signal path once more so a delayed abnormal event cannot
+    # hide behind the status transition assertion.
+    wait_for(qapp, lambda: any(stream == "system" for stream, _ in manager.get_logs("normal-no-alert")))
+    assert events == []
+
+
+def test_get_web_url_detects_listeners_and_chooses_lowest_port(tmp_path, qapp, manager):
+    script = write_script(
+        tmp_path,
+        "listeners.py",
+        "import socket, time\n"
+        "listeners = []\n"
+        "for _ in range(2):\n"
+        "    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+        "    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+        "    listener.bind(('127.0.0.1', 0))\n"
+        "    listener.listen(1)\n"
+        "    listeners.append(listener)\n"
+        "print('ports=' + ','.join(str(item.getsockname()[1]) for item in listeners), flush=True)\n"
+        "time.sleep(600)\n",
+    )
+    register(manager, python_config(script, "listeners"))
+
+    manager.start("listeners")
+    wait_for(qapp, lambda: manager.get_status("listeners") == "Running")
+    wait_for(qapp, lambda: bool(logs_for(manager, "listeners", "stdout")))
+    line = logs_for(manager, "listeners", "stdout")[0]
+    ports = [int(value) for value in line.removeprefix("ports=").split(",")]
+    expected = f"http://127.0.0.1:{min(ports)}"
+    wait_for(qapp, lambda: manager.get_web_url("listeners") == expected)
+    assert manager.get_web_url("listeners") == expected
+
+
+def test_get_web_url_detects_recursive_child_listener(tmp_path, qapp, manager):
+    port_file = tmp_path / "listener-port.txt"
+    child_code = (
+        "import socket, time\n"
+        "from pathlib import Path\n"
+        "listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+        "listener.bind(('127.0.0.1', 0))\n"
+        "listener.listen(1)\n"
+        f"Path({str(port_file)!r}).write_text(str(listener.getsockname()[1]), encoding='ascii')\n"
+        "time.sleep(600)\n"
+    )
+    script = write_script(
+        tmp_path,
+        "child_listener.py",
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        "time.sleep(600)\n",
+    )
+    register(manager, python_config(script, "child-listener"))
+
+    manager.start("child-listener")
+    wait_for(qapp, lambda: manager.get_status("child-listener") == "Running")
+    wait_for(qapp, lambda: pid_file_ready(port_file), message="child listener did not start")
+    port = int(port_file.read_text(encoding="ascii"))
+    expected = f"http://127.0.0.1:{port}"
+    wait_for(qapp, lambda: manager.get_web_url("child-listener") == expected)
+    assert manager.get_web_url("child-listener") == expected
+
+
+def test_get_web_url_is_none_when_not_listening_or_stopped(tmp_path, qapp, manager):
+    script = write_script(
+        tmp_path,
+        "not_listening.py",
+        "import time\n"
+        "time.sleep(600)\n",
+    )
+    register(manager, python_config(script, "not-listening"))
+
+    manager.start("not-listening")
+    wait_for(qapp, lambda: manager.get_status("not-listening") == "Running")
+    assert manager.get_web_url("not-listening") is None
+
+    manager.stop("not-listening")
+    wait_for(qapp, lambda: manager.get_status("not-listening") == "Stopped")
+    wait_for(qapp, lambda: manager.get_web_url("not-listening") is None)
+    assert manager.get_web_url("not-listening") is None
+
+
+def test_stop_restart_and_shutdown_do_not_emit_abnormal_event(tmp_path, qapp, manager):
+    script = write_script(
+        tmp_path,
+        "intentional_stop.py",
+        "import time\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(600)\n",
+    )
+    register(manager, python_config(script, "intentional-stop"))
+    events = []
+    manager.abnormal_exit.connect(lambda script_id, code: events.append((script_id, code)))
+
+    manager.start("intentional-stop")
+    wait_for(qapp, lambda: manager.get_status("intentional-stop") == "Running")
+    first_pid = manager.get_pid("intentional-stop")
+    manager.stop("intentional-stop")
+    wait_for(qapp, lambda: manager.get_status("intentional-stop") == "Stopped")
+    wait_for(qapp, lambda: not pid_is_alive(first_pid))
+    assert events == []
+
+    manager.restart("intentional-stop")
+    wait_for(qapp, lambda: manager.get_status("intentional-stop") == "Running")
+    second_pid = manager.get_pid("intentional-stop")
+    assert second_pid and second_pid != first_pid
+    assert events == []
+
+    manager.restart("intentional-stop")
+    wait_for(qapp, lambda: manager.get_status("intentional-stop") == "Running")
+    third_pid = manager.get_pid("intentional-stop")
+    assert third_pid and third_pid != second_pid
+    assert events == []
+
+    manager.shutdown()
+    assert not pid_is_alive(third_pid)
+    qapp.processEvents()
+    assert events == []
+
+
 def test_log_buffer_keeps_only_latest_5000_lines(tmp_path, qapp, manager):
     script = write_script(
         tmp_path,

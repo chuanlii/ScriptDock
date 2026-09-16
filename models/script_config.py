@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import unicodedata
+from urllib.parse import urlsplit
 
 
 # The values in the design document use the language name for Python and
@@ -58,6 +60,38 @@ def _require_text(value: Any, field_name: str, *, allow_empty: bool = False) -> 
     return value
 
 
+def _validate_web_url(value: Any) -> None:
+    """Validate an optional HTTP(S) URL used to open a script web service.
+
+    ``urllib.parse`` is intentionally used only for URL structure parsing;
+    this check does not make a network request.  Accessing ``SplitResult.port``
+    is important because malformed and out-of-range ports raise lazily there.
+    """
+
+    url = _require_text(value, "web_url", allow_empty=True)
+    if not url:
+        return
+    # urlsplit strips some leading C0 controls before parsing, so reject them
+    # first instead of accidentally accepting a value different from what was
+    # persisted.  Whitespace is not valid unescaped URL text either.
+    if any(unicodedata.category(character) == "Cc" for character in url):
+        raise ValueError("web_url 不能包含控制字符。")
+    if any(character.isspace() for character in url):
+        raise ValueError("web_url 不能包含空白字符。")
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        # Force lazy validation of non-numeric, negative, and out-of-range
+        # ports.  An explicitly empty port is malformed as well.
+        parsed.port
+    except ValueError as error:
+        raise ValueError(f"web_url 不是有效的网址：{error}") from error
+    if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+        raise ValueError("web_url 必须是包含 hostname 的 http 或 https 网址。")
+    if parsed.netloc.endswith(":"):
+        raise ValueError("web_url 不是有效的网址：端口不能为空。")
+
+
 @dataclass
 class ScriptConfig:
     """Configuration for a single locally managed script.
@@ -74,6 +108,8 @@ class ScriptConfig:
     args: list[str] = field(default_factory=list)
     working_directory: str = ""
     interpreter: str | None = None
+    auto_start: bool = False
+    web_url: str = ""
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ScriptConfig":
@@ -92,6 +128,8 @@ class ScriptConfig:
 
         working_directory = data.get("working_directory", "")
         interpreter = data.get("interpreter")
+        auto_start = data.get("auto_start", False)
+        web_url = data.get("web_url", "")
         config = cls(
             id=data["id"],
             name=data["name"],
@@ -100,6 +138,8 @@ class ScriptConfig:
             args=list(raw_args),
             working_directory=working_directory,
             interpreter=interpreter,
+            auto_start=auto_start,
+            web_url=web_url,
         )
         config.validate()
         return config
@@ -115,6 +155,8 @@ class ScriptConfig:
             "args": list(self.args),
             "working_directory": self.working_directory,
             "interpreter": self.interpreter,
+            "auto_start": self.auto_start,
+            "web_url": self.web_url,
         }
 
     def validate(self) -> None:
@@ -138,6 +180,9 @@ class ScriptConfig:
             raise ValueError("参数不能包含 NUL 字符。")
         if self.interpreter is not None:
             _require_text(self.interpreter, "interpreter")
+        if not isinstance(self.auto_start, bool):
+            raise ValueError("auto_start 必须是布尔值。")
+        _validate_web_url(self.web_url)
 
         canonical_type = _TYPE_ALIASES.get(raw_type)
         if canonical_type is None:

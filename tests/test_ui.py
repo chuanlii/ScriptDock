@@ -16,8 +16,8 @@ import pytest
 # without a display server. Set this before importing any Qt module.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
+from PySide6.QtCore import QObject, QUrl, Qt, Signal
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QPushButton
 
 from models import ScriptConfig
 from ui.main_window import MainWindow
@@ -40,9 +40,10 @@ def close_widgets():
     windows = []
     yield windows
     for window in windows:
-        timer = getattr(window, "_log_timer", None)
-        if timer is not None:
-            timer.stop()
+        for timer_name in ("_log_timer", "_web_timer"):
+            timer = getattr(window, timer_name, None)
+            if timer is not None:
+                timer.stop()
         window.close()
         window.deleteLater()
     app = QApplication.instance()
@@ -60,17 +61,21 @@ class FakeManager(QObject):
         super().__init__()
         self.statuses = {script.id: "Stopped" for script in scripts}
         self.logs = {script.id: [] for script in scripts}
+        self.web_urls = {script.id: None for script in scripts}
+        self.web_calls = []
         self.calls = []
 
     def register(self, config):
         self.calls.append(("register", config.id))
         self.statuses.setdefault(config.id, "Stopped")
         self.logs.setdefault(config.id, [])
+        self.web_urls.setdefault(config.id, None)
 
     def unregister(self, script_id):
         self.calls.append(("unregister", script_id))
         self.statuses.pop(script_id, None)
         self.logs.pop(script_id, None)
+        self.web_urls.pop(script_id, None)
 
     def get_status(self, script_id):
         return self.statuses.get(script_id, "Stopped")
@@ -80,6 +85,10 @@ class FakeManager(QObject):
 
     def get_logs(self, script_id):
         return list(self.logs.get(script_id, []))
+
+    def get_web_url(self, script_id):
+        self.web_calls.append(script_id)
+        return self.web_urls.get(script_id)
 
     def start(self, script_id):
         self.calls.append(("start", script_id))
@@ -118,6 +127,8 @@ def make_config(
     args=None,
     working_directory="",
     interpreter=None,
+    auto_start=False,
+    web_url="",
 ):
     return ScriptConfig(
         id=script_id,
@@ -127,6 +138,8 @@ def make_config(
         args=list(args or []),
         working_directory=working_directory,
         interpreter=interpreter,
+        auto_start=auto_start,
+        web_url=web_url,
     )
 
 
@@ -201,6 +214,20 @@ def test_script_dialog_windows_args_whitespace_chinese_and_quotes_roundtrip(qapp
         # The edit form serializes list[str] to a Windows command line and
         # get_config() parses it back to the model representation.
         assert dialog.get_config().args == args
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qapp.processEvents()
+
+
+def test_script_dialog_edit_preserves_auto_start_and_web_url_defaults(qapp):
+    original = make_config(auto_start=True, web_url="http://localhost:8080")
+    dialog = ScriptDialog(config=original)
+    try:
+        assert not hasattr(dialog, "web_url_edit")
+        edited = dialog.get_config()
+        assert edited.auto_start is True
+        assert edited.web_url == original.web_url
     finally:
         dialog.close()
         dialog.deleteLater()
@@ -400,6 +427,112 @@ def test_status_signal_updates_status_cell_and_row_button_states(
     assert controls["stop"].isEnabled()
     assert controls["restart"].isEnabled()
 
+    manager.set_status(script.id, "Failed")
+    qapp.processEvents()
+    status_item = window.script_table.item(0, 2)
+    assert status_item.text() == "Failed"
+    assert status_item.toolTip() == "Failed"
+    assert status_item.foreground().color().name() == "#c83b46"
+
+
+def test_main_window_shows_auto_start_column(qapp, close_widgets):
+    enabled = make_config("enabled", "已启用", auto_start=True)
+    disabled = make_config("disabled", "未启用", auto_start=False)
+    window, _manager, _config_manager = build_window(
+        qapp, [enabled, disabled], close_widgets=close_widgets
+    )
+
+    assert window.script_table.columnCount() == 5
+    assert [
+        window.script_table.horizontalHeaderItem(index).text()
+        for index in range(window.script_table.columnCount())
+    ] == ["名称", "类型", "状态", "自启动", "操作"]
+    assert window.script_table.item(0, 3).text() == "是"
+    assert window.script_table.item(1, 3).text() == "否"
+
+
+def test_main_window_has_no_exit_button(qapp, close_widgets):
+    window, _manager, _config_manager = build_window(
+        qapp, [make_config()], close_widgets=close_widgets
+    )
+
+    assert not hasattr(window, "exit_button")
+    assert all(button.text() != "退出" for button in window.findChildren(QPushButton))
+
+
+def test_web_button_uses_detected_url_only_when_running(
+    qapp, monkeypatch, close_widgets
+):
+    valid = make_config("valid", web_url="https://legacy.example/ignored")
+    invalid = make_config("invalid")
+    window, _manager, _config_manager = build_window(
+        qapp, [valid, invalid], close_widgets=close_widgets
+    )
+    manager = window.manager
+    opened = []
+    monkeypatch.setattr(
+        "ui.main_window.QDesktopServices.openUrl",
+        lambda url: opened.append(url) or True,
+    )
+
+    manager.web_urls[valid.id] = "http://127.0.0.1:4321/dashboard"
+    manager.web_urls[invalid.id] = "ftp://example.test/dashboard"
+    assert not window._row_controls[valid.id]["web"].isEnabled()
+    assert not window._row_controls[invalid.id]["web"].isEnabled()
+
+    manager.set_status(valid.id, "Running")
+    manager.set_status(invalid.id, "Running")
+    qapp.processEvents()
+    assert window._row_controls[valid.id]["web"].isEnabled()
+    assert not window._row_controls[invalid.id]["web"].isEnabled()
+
+    # The URL is fetched again on click, so a newly detected port wins over
+    # the value that enabled the button during the previous refresh.
+    manager.web_urls[valid.id] = "http://127.0.0.1:4322/dashboard"
+    window._row_controls[valid.id]["web"].click()
+    qapp.processEvents()
+    assert len(opened) == 1
+    assert isinstance(opened[0], QUrl)
+    assert opened[0].toString() == manager.web_urls[valid.id]
+    assert manager.web_calls[-1] == valid.id
+
+    manager.set_status(valid.id, "Stopped")
+    qapp.processEvents()
+    assert not window._row_controls[valid.id]["web"].isEnabled()
+
+
+def test_web_button_refresh_timer_detects_late_port(qapp, close_widgets):
+    script = make_config()
+    window, manager, _config_manager = build_window(
+        qapp, [script], close_widgets=close_widgets
+    )
+    assert window._web_timer.interval() == 1000
+
+    manager.set_status(script.id, "Running")
+    qapp.processEvents()
+    assert not window._row_controls[script.id]["web"].isEnabled()
+
+    manager.web_urls[script.id] = "http://127.0.0.1:5432"
+    window._web_timer.timeout.emit()
+    qapp.processEvents()
+    assert window._row_controls[script.id]["web"].isEnabled()
+
+
+def test_web_button_warns_when_desktop_open_fails(qapp, monkeypatch, close_widgets):
+    script = make_config(web_url="http://localhost:8080")
+    window, manager, _config_manager = build_window(
+        qapp, [script], close_widgets=close_widgets
+    )
+    manager.web_urls[script.id] = "http://127.0.0.1:8080"
+    manager.set_status(script.id, "Running")
+    qapp.processEvents()
+    shown = patch_message_boxes(monkeypatch)
+    monkeypatch.setattr("ui.main_window.QDesktopServices.openUrl", lambda _url: False)
+
+    window._row_controls[script.id]["web"].click()
+    qapp.processEvents()
+    assert [kind for kind, _args in shown] == ["warning"]
+
 
 def test_log_filter_and_name_selection(qapp, close_widgets):
     first, second = make_config(), make_config(script_id="second", name="Second")
@@ -408,7 +541,7 @@ def test_log_filter_and_name_selection(qapp, close_widgets):
     manager.logs[second.id] = [("stdout", "second normal"), ("stderr", "second error")]
     window.script_table.selectRow(0)
     window._load_logs(first.id)
-    assert window.script_table.columnCount() == 4
+    assert window.script_table.columnCount() == 5
     assert window.log_filter.currentText() == "std"
     assert "normal" in window.log_view.toPlainText() and "error" in window.log_view.toPlainText()
     assert "exit" in window.log_view.toPlainText()

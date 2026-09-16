@@ -29,6 +29,49 @@ def test_model_round_trip_and_supported_type_inference():
     assert ScriptConfig.from_dict(script.to_dict()) == script
 
 
+def test_new_optional_fields_default_for_legacy_records_and_round_trip():
+    legacy = {
+        "id": "legacy",
+        "name": "Legacy",
+        "type": "python",
+        "path": "scripts/legacy.py",
+    }
+    loaded = ScriptConfig.from_dict(legacy)
+    assert loaded.auto_start is False
+    assert loaded.web_url == ""
+
+    loaded.auto_start = True
+    loaded.web_url = "https://localhost:8443/dashboard"
+    restored = ScriptConfig.from_dict(loaded.to_dict())
+    assert restored == loaded
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None, [], {}])
+def test_auto_start_requires_a_real_bool(value):
+    data = make_config().to_dict()
+    data["auto_start"] = value
+    with pytest.raises(ValueError, match="auto_start"):
+        ScriptConfig.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    "web_url",
+    [
+        "ftp://example.test",
+        "example.test:8080",
+        "http:///missing-host",
+        "http://example.test:not-a-port",
+        "http://example.test:65536",
+        "http://example.test\n/dashboard",
+    ],
+)
+def test_web_url_requires_http_host_and_valid_port(web_url):
+    data = make_config().to_dict()
+    data["web_url"] = web_url
+    with pytest.raises(ValueError, match="web_url"):
+        ScriptConfig.from_dict(data)
+
+
 def test_model_accepts_extension_aliases():
     script = make_config()
     script.type = "py"
